@@ -1,4 +1,5 @@
-import {ChangeDetectionStrategy, Component, signal, computed, OnInit, OnDestroy} from '@angular/core';
+import {ChangeDetectionStrategy, Component, signal, computed, OnInit, OnDestroy, inject, CUSTOM_ELEMENTS_SCHEMA} from '@angular/core';
+import { WalletService } from './wallet.service';
 import {MatIconModule} from '@angular/material/icon';
 import {CommonModule} from '@angular/common';
 import {translations, Language} from '../translations';
@@ -19,23 +20,33 @@ const GBLIN_ABI = [
   "function balanceOf(address account) view returns (uint256)"
 ];
 
-interface BasescanTransaction {
+// Removed unused interface BasescanTransaction
+
+interface BlockscoutTransaction {
   hash: string;
   from: string;
-  to: string;
+  to: string | null;
   value: string;
   timeStamp: string;
-  functionName: string;
+}
+
+interface BlockscoutResponse {
+  status: string;
+  message: string;
+  result: BlockscoutTransaction[];
 }
 
 @Component({
   changeDetection: ChangeDetectionStrategy.OnPush,
   selector: 'app-root',
   imports: [MatIconModule, CommonModule],
+  schemas: [CUSTOM_ELEMENTS_SCHEMA],
   templateUrl: './app.html',
   styleUrl: './app.css',
 })
 export class App implements OnInit, OnDestroy {
+  private walletService = inject(WalletService);
+  userAccount = this.walletService.account;
   contractAddress = "0xc475851f9101A2AC48a84EcF869766A94D301FaA";
   copied = signal(false);
   showLangSelector = signal(false);
@@ -68,12 +79,27 @@ export class App implements OnInit, OnDestroy {
     { code: 'de', name: 'Deutsch', flag: '🇩🇪' },
   ];
 
+  // App state
+  logo = 'https://raw.githubusercontent.com/rubbe89/gblin-assets/main/LOGO_GBLIN.png';
+  officialEmail = 'gblin.protocol@proton.me';
+  twitterUrl = 'https://x.com/GBLIN_Protocol';
+  warpcastUrl = 'https://warpcast.com/gblin';
+  githubUrl = 'https://github.com/gblinproject/gblin-dapp';
+  pool1Url = 'https://aerodrome.finance/pool/0x2372c88219a821b54c765aa52e47614248659e28';
+  pool2Url = 'https://aerodrome.finance/pool/0xdaecc15bf028bc4d135260d044b87001dafb3c22';
+  contractRenounced = true; // Renounced Ownership
+  
   // Dashboard signals
   supply = signal<string>('---');
   stabilityFund = signal<string>('---');
   buyAmount = signal('0.01');
   quoteBuyGBLIN = signal('0.00');
   isMinting = signal(false);
+  rebalanceData = signal<{basketData: {symbol: string, targetWeight: bigint}[]} | null>(null);
+
+  formatWeight(weight: bigint): string {
+    return (Number(weight) / 100).toString();
+  }
 
   // Trade Interface signals
   mode = signal<'buy' | 'sell'>('buy');
@@ -81,7 +107,6 @@ export class App implements OnInit, OnDestroy {
   selectedToken = signal('ETH');
   isTokenModalOpen = signal(false);
   isWalletModalOpen = signal(false);
-  account = signal<string | null>(null);
   isConnecting = signal(false);
   quote = signal('0');
   rawQuote = signal<bigint>(0n);
@@ -113,7 +138,7 @@ export class App implements OnInit, OnDestroy {
   tradeTxHash = signal<string | null>(null);
   tradeError = signal<string | null>(null);
   showForceOption = signal(false);
-  lastUpdate = signal<string>(new Date().toLocaleTimeString('it-IT'));
+  lastUpdate = signal<string>(new Date().toLocaleTimeString(this.language()));
   isRefreshing = signal(false);
   slippage = signal(1);
   searchQuery = signal('');
@@ -146,7 +171,7 @@ export class App implements OnInit, OnDestroy {
 
   ngOnInit() {
     this.fetchData();
-    this.intervalId = setInterval(() => this.fetchData(), 15000);
+    this.intervalId = setInterval(() => this.fetchData(), 60000); // Aumento a 60 secondi
   }
 
   ngOnDestroy() {
@@ -167,7 +192,7 @@ export class App implements OnInit, OnDestroy {
       this.stabilityFund.set(parseFloat(ethers.formatEther(stabFund)).toFixed(8));
 
       // Fetch user balances if connected
-      const currentAccount = this.account();
+      const currentAccount = this.userAccount();
       if (currentAccount) {
         const [ethBal, gblinBal] = await Promise.all([
           this.provider.getBalance(currentAccount),
@@ -179,83 +204,9 @@ export class App implements OnInit, OnDestroy {
         this.ethBalance.set('0.00000000');
         this.gblinBalance.set('0.00000000');
       }
-    } catch (e) {
-      console.error("Error fetching dashboard data", e);
-    }
 
-    try {
-      // Fetch real GBLIN transactions from Basescan API (txlist matches the "Transactions" tab)
-      const response = await fetch(`https://api.basescan.org/api?module=account&action=txlist&address=${this.contractAddress}&startblock=0&endblock=99999999&page=1&offset=10&sort=desc`);
-      const json = await response.json();
-      
-      let recentLogs: { txHash: string; executor: string; tokenIn: string; tokenOut: string; amount: string; time: string; type: string }[] = [];
-
-      if (json.status === '1' && Array.isArray(json.result)) {
-        recentLogs = (json.result as BasescanTransaction[]).map((tx) => {
-          const time = new Date(parseInt(tx.timeStamp) * 1000);
-          const func = tx.functionName || '';
-          let type = 'TRANSAZIONE';
-          if (func.includes('buyGBLIN')) type = 'ACQUISTO';
-          else if (func.includes('sellGBLIN')) type = 'VENDITA';
-          else if (func.includes('incentivizedRebalance')) type = 'REBALANCE';
-          else if (tx.value !== '0') type = 'INVIO ETH';
-
-          return {
-            txHash: tx.hash,
-            executor: tx.from,
-            tokenIn: '---',
-            tokenOut: 'GBLIN',
-            amount: tx.value !== '0' ? parseFloat(ethers.formatEther(tx.value)).toFixed(8) : '---',
-            time: time.toLocaleString('it-IT', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' }),
-            type: type
-          };
-        });
-      }
-
-        // Fallback if txlist is empty or rate-limited
-        if (recentLogs.length === 0) {
-          try {
-            const latestBlock = await this.provider.getBlockNumber();
-            const logs = await this.provider.getLogs({
-              address: this.contractAddress,
-              fromBlock: latestBlock - 5000,
-              toBlock: latestBlock
-            });
-            
-            if (logs && Array.isArray(logs)) {
-              recentLogs = await Promise.all(logs.reverse().slice(0, 10).map(async log => {
-                const block = await this.provider.getBlock(log.blockNumber);
-                const time = block ? new Date(block.timestamp * 1000) : new Date();
-                
-                let from = '---';
-                let to = '---';
-                
-                if (log.topics && log.topics.length > 1 && log.topics[1]) {
-                  from = ethers.getAddress('0x' + log.topics[1].slice(26));
-                }
-                if (log.topics && log.topics.length > 2 && log.topics[2]) {
-                  to = ethers.getAddress('0x' + log.topics[2].slice(26));
-                }
-                
-                let type = 'TRASFERIMENTO';
-                if (from === ethers.ZeroAddress) type = 'ACQUISTO';
-                else if (to === ethers.ZeroAddress) type = 'VENDITA';
-
-                return {
-                  txHash: log.transactionHash,
-                  executor: from === ethers.ZeroAddress ? to : from,
-                  tokenIn: '---',
-                  tokenOut: 'GBLIN',
-                  amount: '---',
-                  time: time.toLocaleString('it-IT', { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' }),
-                  type: type
-                };
-              }));
-            }
-          } catch (logErr) {
-            console.warn("Fallback logs fetch failed", logErr);
-          }
-        }
+      // Fetch transactions from Blockscout
+      const recentLogs = await this.fetchTransactions();
 
       this.stats.set({
         tvlUsd: 1250000,
@@ -267,18 +218,42 @@ export class App implements OnInit, OnDestroy {
         ],
         recentLogs: recentLogs
       });
-      this.isLoadingStats.set(false);
-      this.lastUpdate.set(new Date().toLocaleTimeString('it-IT'));
     } catch (e) {
-      console.error("Error fetching stats", e);
-      this.isLoadingStats.set(false);
-    } finally {
-      this.isRefreshing.set(false);
+      console.error("Error fetching dashboard data", e);
+    }
+
+    this.isLoadingStats.set(false);
+    this.lastUpdate.set(new Date().toLocaleTimeString(this.language()));
+    this.isRefreshing.set(false);
+  }
+
+  async fetchTransactions() {
+    try {
+      const url = `https://api.blockscout.com/v2/api?chain_id=${CHAIN_ID}&module=account&action=txlist&address=${CONTRACT_ADDRESS}&sort=desc&page=1&offset=10&apikey=${BLOCKSCOUT_API_KEY}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error('Blockscout API error');
+      
+      const data = (await response.json()) as BlockscoutResponse;
+      if (data.status === '1' && Array.isArray(data.result)) {
+        return data.result.map((tx: BlockscoutTransaction) => ({
+          txHash: tx.hash,
+          executor: tx.from,
+          tokenIn: '---', // Blockscout txlist doesn't easily show internal swaps without more parsing
+          tokenOut: '---',
+          amount: ethers.formatEther(tx.value),
+          time: new Date(parseInt(tx.timeStamp) * 1000).toLocaleTimeString(this.language()),
+          type: tx.to?.toLowerCase() === this.contractAddress.toLowerCase() ? 'Contract Call' : 'Transfer'
+        }));
+      }
+      return [];
+    } catch (e) {
+      console.error("Error fetching transactions", e);
+      return [];
     }
   }
 
   async handleArbitrage() {
-    if (!this.account() || !(window as unknown as {ethereum: unknown}).ethereum) {
+    if (!this.userAccount() || !(window as unknown as {ethereum: unknown}).ethereum) {
       this.openWalletModal();
       return;
     }
@@ -288,21 +263,22 @@ export class App implements OnInit, OnDestroy {
       this.arbError.set(null);
       this.arbTxHash.set(null);
 
-      const provider = new ethers.BrowserProvider((window as unknown as {ethereum: ethers.Eip1193Provider}).ethereum);
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(this.contractAddress, GBLIN_ABI, signer);
-
-      // Verifica preventiva: se fallisce qui, non proviamo nemmeno a inviare la transazione
-      try {
-        await contract['incentivizedRebalance'].staticCall();
-      } catch (staticErr: unknown) {
-        console.warn("Static call failed, rebalance not needed:", staticErr);
-        this.arbError.set("Nessun rebalance necessario al momento o condizioni non soddisfatte.");
+      // Check network
+      const isCorrectNetwork = await this.checkNetwork();
+      if (!isCorrectNetwork) {
+        this.arbError.set(this.t()('trade.errors.wrongNetwork'));
         this.isArbitraging.set(false);
         return;
       }
 
-      const tx = await contract['incentivizedRebalance']();
+      const provider = new ethers.BrowserProvider((window as unknown as {ethereum: ethers.Eip1193Provider}).ethereum);
+      const signer = await provider.getSigner();
+      const contract = new ethers.Contract(this.contractAddress, GBLIN_ABI, signer);
+
+      // We add a manual gasLimit to skip ethers.js gas estimation.
+      // This forces the transaction to be sent to the wallet (e.g. MetaMask),
+      // which will then simulate it and allow the user to force-send it if they want.
+      const tx = await contract['incentivizedRebalance']({ gasLimit: 1000000 });
       this.arbTxHash.set(tx.hash);
       await tx.wait();
       
@@ -310,13 +286,16 @@ export class App implements OnInit, OnDestroy {
     } catch (err: unknown) {
       console.error(err);
       const errorObj = err as { code?: string; message?: string; info?: { error?: { code: number } } };
+      const errorMsg = errorObj.message || (err as Error).message || "";
       
-      if (errorObj.code === 'CALL_EXCEPTION' || errorObj.message?.includes('CALL_EXCEPTION')) {
-        this.arbError.set("Nessun rebalance necessario al momento o condizioni non soddisfatte.");
-      } else if (errorObj.code === '4001' || errorObj.info?.error?.code === 4001) {
-        this.arbError.set("Transazione annullata dall'utente.");
+      if (errorObj.code === 'CALL_EXCEPTION' || errorMsg.includes('CALL_EXCEPTION')) {
+        this.arbError.set(this.t()('trade.errors.noRebalance'));
+      } else if (errorObj.code === '4001' || errorObj.info?.error?.code === 4001 || errorMsg.includes('user rejected')) {
+        this.arbError.set(this.t()('trade.errors.userCancelled'));
+      } else if (errorMsg.includes('Ledger')) {
+        this.arbError.set("Ledger error: Please ensure your Ledger is unlocked, the Ethereum app is open, and 'Blind Signing' is enabled in the app settings.");
       } else {
-        this.arbError.set((err as Error).message || "Errore durante la transazione");
+        this.arbError.set(errorMsg || this.t()('trade.errors.txError'));
       }
     } finally {
       this.isArbitraging.set(false);
@@ -352,7 +331,7 @@ export class App implements OnInit, OnDestroy {
   }
 
   async handleMint() {
-    if (!this.account() || !(window as unknown as {ethereum: unknown}).ethereum || !this.buyAmount() || isNaN(Number(this.buyAmount())) || Number(this.buyAmount()) <= 0) return;
+    if (!this.userAccount() || !(window as unknown as {ethereum: unknown}).ethereum || !this.buyAmount() || isNaN(Number(this.buyAmount())) || Number(this.buyAmount()) <= 0) return;
     
     try {
       this.isMinting.set(true);
@@ -471,7 +450,7 @@ export class App implements OnInit, OnDestroy {
     try {
       // Use wallet provider if connected for more accurate quote
       let activeContract = this.contract;
-      if (this.account() && (window as unknown as {ethereum: ethers.Eip1193Provider}).ethereum) {
+      if (this.userAccount() && (window as unknown as {ethereum: ethers.Eip1193Provider}).ethereum) {
         const provider = new ethers.BrowserProvider((window as unknown as {ethereum: ethers.Eip1193Provider}).ethereum);
         activeContract = new ethers.Contract(this.contractAddress, GBLIN_ABI, provider);
       }
@@ -575,7 +554,7 @@ export class App implements OnInit, OnDestroy {
   async connectWallet() {
     this.isWalletModalOpen.set(false);
     if (typeof window === 'undefined' || !(window as unknown as {ethereum: unknown}).ethereum) {
-      this.tradeError.set("MetaMask o un wallet compatibile non trovato. Installa l'estensione per continuare.");
+      this.tradeError.set(this.t()('trade.errors.noWallet'));
       return;
     }
 
@@ -585,20 +564,20 @@ export class App implements OnInit, OnDestroy {
       const provider = new ethers.BrowserProvider((window as unknown as {ethereum: ethers.Eip1193Provider}).ethereum);
       const accounts = await provider.send("eth_requestAccounts", []);
       if (accounts.length > 0) {
-        this.account.set(accounts[0]);
+        this.userAccount.set(accounts[0]);
         await this.checkNetwork();
         this.fetchData(); // Immediate balance update
       }
     } catch (err: unknown) {
       console.error(err);
-      this.tradeError.set((err as Error).message || "Errore durante la connessione al wallet");
+      this.tradeError.set((err as Error).message || this.t()('trade.errors.txError'));
     } finally {
       this.isConnecting.set(false);
     }
   }
 
   async handleTrade(force = false) {
-    if (!this.account() || !(window as unknown as {ethereum: unknown}).ethereum || !this.amount() || Number(this.amount()) <= 0) return;
+    if (!this.userAccount() || !(window as unknown as {ethereum: unknown}).ethereum || !this.amount() || Number(this.amount()) <= 0) return;
 
     try {
       this.isTransacting.set(true);
@@ -609,7 +588,7 @@ export class App implements OnInit, OnDestroy {
       // Check network
       const isCorrectNetwork = await this.checkNetwork();
       if (!isCorrectNetwork) {
-        this.tradeError.set("Per favore, passa alla rete Base Mainnet nel tuo wallet.");
+        this.tradeError.set(this.t()('trade.errors.wrongNetwork'));
         this.isTransacting.set(false);
         return;
       }
@@ -617,7 +596,7 @@ export class App implements OnInit, OnDestroy {
       // Check balance before proceeding
       const userBalance = this.mode() === 'buy' ? this.ethBalance() : this.gblinBalance();
       if (parseFloat(userBalance) < parseFloat(this.amount())) {
-        this.tradeError.set(`Saldo insufficiente. Hai ${userBalance} ${this.mode() === 'buy' ? 'ETH' : 'GBLIN'}, ma stai provando a usare ${this.amount()}.`);
+        this.tradeError.set(this.t()('trade.errors.insufficientBalance').replace('{balance}', userBalance).replace('{token}', this.mode() === 'buy' ? 'ETH' : 'GBLIN').replace('{amount}', this.amount()));
         this.isTransacting.set(false);
         return;
       }
@@ -650,7 +629,7 @@ export class App implements OnInit, OnDestroy {
       }
 
       if (currentRawQuote === 0n) {
-        this.tradeError.set("Impossibile ottenere un preventivo valido. Riprova.");
+        this.tradeError.set(this.t()('trade.errors.quoteFailed'));
         this.isTransacting.set(false);
         return;
       }
@@ -690,10 +669,10 @@ export class App implements OnInit, OnDestroy {
           const errorMsg = err.message || "";
           
           if (errorData.includes("0x8199f5f3") || errorMsg.includes("0x8199f5f3")) {
-            this.tradeError.set("Slippage rilevato dalla simulazione. Il prezzo potrebbe essere cambiato. Prova ad aumentare lo slippage o forza l'invio se sei sicuro.");
+            this.tradeError.set(this.t()('trade.errors.slippageDetected'));
             this.showForceOption.set(true);
           } else {
-            this.tradeError.set("La simulazione indica che la transazione potrebbe fallire: " + (err.reason || "Errore tecnico. Verifica il saldo."));
+            this.tradeError.set(this.t()('trade.errors.simFailed') + (err.reason || "Technical error. Check balance."));
           }
           this.isTransacting.set(false);
           return;
@@ -733,12 +712,12 @@ export class App implements OnInit, OnDestroy {
       }
       
       if (errorMsg.includes("0x8199f5f3") || errorData.includes("0x8199f5f3")) {
-        this.tradeError.set("Slippage eccessivo durante l'invio. Aumenta lo slippage al 3% o 5% nelle impostazioni.");
+        this.tradeError.set(this.t()('trade.errors.highSlippage'));
         this.showForceOption.set(true);
       } else if (error.code === 4001 || error.info?.error?.code === 4001) {
-        this.tradeError.set("Transazione annullata dall'utente.");
+        this.tradeError.set(this.t()('trade.errors.userCancelled'));
       } else {
-        this.tradeError.set("Errore durante la transazione: " + (error.message || "Errore sconosciuto"));
+        this.tradeError.set(this.t()('trade.errors.txError') + (error.message || "Unknown error"));
       }
       this.isTransacting.set(false);
     }
